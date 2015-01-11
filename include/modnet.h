@@ -3,51 +3,27 @@
 
 #ifndef MODNET_H
 #define MODNET_H
+#include <sys/uio.h>
+#include "modnet_sys.h"
 
-#include <stdint.h>
-#include <sys/socket.h>
-#include <sys/syscall.h>
+typedef struct modnet_module_operations {
+	// TODO(sharva) support sg, multiple iovecs.
+	struct iovec (*process_left)(struct iovec input, void *state_ptr);
+	struct iovec (*process_right)(struct iovec input, void *state_ptr);
+	/* This will be called when the connection is being deleted.*/
+	void (*delete_connection)(void *state_ptr);
+	/* Return the state_ptr, which is transparent for modnet, but
+	 * will be passed to process_left, process_right and delete_connection.*/
+	void * (*init_connection)();
+	/* Should be set if the user wants the connections to be blocking */
+	/* However the blocking case is not properly handled. */
+	int blocking;
+	/* For blocking case more than one worker per core is desirable, and user
+	 * can configure it through this parameter.*/
+	int workers_per_core;
+	/* String representing module name */
+	char * module_name;
+} modnet_module_operations_t;
 
-#define	__NR_modnet_getsockets		400 	
-#define	__NR_modnet_register    	401
-#define __NR_modnet_apply       	402
-#define __NR_modnet_isock_send		403
-#define __NR_modnet_isock_yank		404
-#define __NR_modnet_map_last_sock 	405
-#define __NR_modnet_yank			406
-#define __NR_modnet_yankputdata		407
-#define __NR_modnet_yankdata		408
-#define __NR_modnet_interception	409
-#define __NR_modnet_module_end		410
-#define __NR_modnet_yield			411
-
-struct tcp_sock_stats {
-	uint32_t snd_cwnd;
-	uint32_t snd_una;
-	uint32_t write_seq;  
-	uint32_t mss_size;
-	uint32_t srtt;
-	uint32_t snd_wnd;
-};
-
-int modnet_register(char * module_name) {
-	return syscall(__NR_modnet_register, module_name);
-}
-
-int modnet_apply(int pid, char * modules[], int num_mods) {
-	return syscall(__NR_modnet_apply, pid, modules, num_mods);
-}
-
-int modnet_getsockets(int left_fds[], int right_fds[], 
-		int * array_length, long cpu_mask) {
-	return syscall(__NR_modnet_getsockets, left_fds, right_fds, 
-			array_length, cpu_mask);
-}
-
-int modnet_isock_send(int sockfd, const void *buf, size_t len, int flags,
-		const struct sockaddr_storage *dest_addr, socklen_t addrlen) {
-	return syscall(__NR_modnet_isock_send, sockfd, buf, len, flags, dest_addr, 
-			addrlen);
-}
-
+int modnet_main(modnet_module_operations_t * module);
 #endif

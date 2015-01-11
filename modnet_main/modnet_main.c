@@ -21,17 +21,21 @@
 #include <pthread.h>
 #include <signal.h>
 #include <sys/epoll.h>
+#include <assert.h>
 /* Libevent. */
 #include <event2/event.h>
 #include <event2/thread.h>
 #include "../include/modnet.h"
 
+// TODO(sp) make this configurable
 #define BUFF_SIZE (1024*10)
-int NUM_WORKERS = 4;
+int __NUM_WORKERS = 4;
 
-struct event_base * main_base;
+struct event_base * __modnet_main_base;
 void on_read(evutil_socket_t fd, short ev, void *arg);
 void on_write(evutil_socket_t fd, short ev, void *arg);
+
+modnet_module_operations_t * __modnet_module_operations = NULL;
 
 /**
  * A struct for client specific data, in this simple case the only
@@ -50,14 +54,13 @@ struct client {
 	int len;
 	struct sockaddr_storage temp_addr;
 	socklen_t addr_len;
+	void * state_ptr;
 };
 
 /**
  * Set a socket to non-blocking mode.
  */
-int setnonblock_fd(int fd)
-{
-
+int setnonblock_fd(int fd) {
 	int flags;
 	
 	flags = fcntl(fd, F_GETFL);
@@ -68,39 +71,41 @@ int setnonblock_fd(int fd)
 		return -1;
 
 	return 0;
-
 }
 
-struct client * alloc_client(int fd){
-
-	setnonblock_fd(fd);
+struct client * alloc_client(int fd, void * state_ptr) {
+	assert(__modnet_module_operations);
+	if(!__modnet_module_operations->blocking)
+		setnonblock_fd(fd);
+	
 	struct client * client = (struct client *)malloc(sizeof(struct client));
 	client->fd = fd;
 	client->closed = 0;
 	client->off = 0;
 	client->len = 0;
+	client->state_ptr = state_ptr;
 	return client;	
 }
 
-void register_client_event(struct client * client){
-
+void register_client_event(struct client * client) {
 	client->ev_read = event_new(
-			main_base, 
+			__modnet_main_base, 
 			client->fd, 
 			EV_READ|EV_PERSIST, 
 			on_read, 
 			client);
+	
 	event_add(client->ev_read, NULL);
+	
 	client->ev_write = event_new(
-			main_base, 
+			__modnet_main_base, 
 			client->fd,
 			EV_WRITE|EV_PERSIST, 
 			on_write, 
 			client);
 }
 
-void close_free_client(struct client * client){
-
+void close_free_client(struct client * client) {
 	close(client->fd);
 	event_free(client->ev_read);
 	event_free(client->ev_write);
@@ -108,10 +113,11 @@ void close_free_client(struct client * client){
 }
 
 
-void close_client(struct client * client){
-
+void close_client(struct client * client) {
+	assert(__modnet_module_operations);
 	close_free_client(client->other);
 	close_free_client(client);
+	__modnet_module_operations->delete_connection(client->state_ptr);
 }
 
 
@@ -120,9 +126,7 @@ void on_write(evutil_socket_t fd, short ev, void *arg)
 	struct client *client = (struct client *)arg;
 	int wlen;
 
-	if (client->len>0)
-	{
-
+	if (client->len>0) {
 		if(client->is_app == 1) {
 			wlen = modnet_isock_send(
 					client->fd, 
@@ -131,8 +135,7 @@ void on_write(evutil_socket_t fd, short ev, void *arg)
 					MSG_NOSIGNAL, 
 					&client->other->temp_addr, 
 					client->other->addr_len);
-		} 
-		else {
+		} else {
 			wlen = send(client->fd, 
 					client->buffer + client->off, 
 					client->len, 
@@ -143,19 +146,14 @@ void on_write(evutil_socket_t fd, short ev, void *arg)
 			fprintf(stderr, "on_write wlen=%d, errno=%d\n",wlen, errno);
 		}
 		
-		if (wlen==-1 && errno==EAGAIN)
-			wlen = 0;
-		
-		else if(wlen==-1)
-		{
+		if (wlen==-1 && errno==EAGAIN) {
+			wlen = 0;	
+		} else if(wlen==-1)	{
 			perror("on_write");
 			event_del(client->ev_write);
-			if(client->other->len>0)
-			{
+			if(client->other->len>0) {
 				event_del(client->other->ev_write);
-			}
-			else
-			{
+			} else {
 				// either my read event or other's write event
 				event_del(client->ev_read);
 			}
@@ -165,7 +163,6 @@ void on_write(evutil_socket_t fd, short ev, void *arg)
 
 		client->len -= wlen;
 		client->off += wlen;
-
 	}
 
 	if(client->len==0)
@@ -227,7 +224,7 @@ on_read(evutil_socket_t fd, short ev, void *arg)
 		// where it will always end, since the last read event 
 		// added will do this. the write event never closes anything unless 
 		// it gets EPIPE.
-		if(client->closed&&client->other->closed)
+		if(client->closed && client->other->closed)
 		{
 			close_client(client);
 		}
@@ -255,16 +252,29 @@ on_read(evutil_socket_t fd, short ev, void *arg)
 		goto FREE_BUF;
 	}
 
-
+	struct iovec output_buf, input_buf;
+	input_buf.iov_base = client->read_buffer;
+	input_buf.iov_len = len;
+	
+	if(client->is_app) {
+		output_buf = __modnet_module_operations->process_left(
+				input_buf, client->state_ptr);
+	} else {
+		output_buf = __modnet_module_operations->process_right(
+				input_buf, client->state_ptr);	
+	}
+	
 	// write the data, put into the buffer of other if it blocks
 	if(client->is_app == 0 && client->addr_len!=0)
 	{
-		wlen = modnet_isock_send(client->other->fd, client->read_buffer, len,
+		wlen = modnet_isock_send(
+				client->other->fd, output_buf.iov_base, output_buf.iov_len,	
 				MSG_NOSIGNAL, &client->temp_addr, client->addr_len);
 	}
 	else
 	{
-		wlen = send(client->other->fd,client->read_buffer,len,MSG_NOSIGNAL);
+		wlen = send(client->other->fd, output_buf.iov_base,
+				output_buf.iov_len, MSG_NOSIGNAL);
 	}
 
 	if(wlen==-1 && errno==EPIPE)
@@ -320,9 +330,12 @@ on_read(evutil_socket_t fd, short ev, void *arg)
 }
 
 void register_client(int fd_app, int fd_nic) {
+	assert(__modnet_module_operations);
+	
 	struct client *client_app, *client_nic;
-	client_app = alloc_client(fd_app);
-	client_nic = alloc_client(fd_nic);
+	void * state_ptr = __modnet_module_operations->init_connection();
+	client_app = alloc_client(fd_app, state_ptr);
+	client_nic = alloc_client(fd_nic, state_ptr);
 	if(client_app == NULL || client_nic == NULL)
 	{
 		printf("Error in malloc\n");
@@ -347,7 +360,6 @@ void get_sockets(long * cpu_mask) {
 
 	val = 0;
 	val = modnet_getsockets(fd_app, fd_nic, &num, *cpu_mask);
-	printf("Dummy module stole %d socket(s)\n", val);
 	int i = 0;
 	for(i = 0; i < val; i++)
 	{	
@@ -378,8 +390,8 @@ void * dispatcher(long * cpu_mask) {
 
 void * event_worker(void * ptr){
 
-	main_base = event_base_new();
-	event_base_loop(main_base, EVLOOP_NO_EXIT_ON_EMPTY);
+	__modnet_main_base = event_base_new();
+	event_base_loop(__modnet_main_base, EVLOOP_NO_EXIT_ON_EMPTY);
 
 	return NULL;
 }
@@ -399,16 +411,12 @@ int get_cpu_count()
 	return count;
 }
 
-int main(int argc, char **argv)
+int modnet_main(modnet_module_operations_t * module)
 {
 
-	if(argc < 2)
-	{
-		printf("usage: dummy_module <module name>\n");
-		return 1;
-	}
-
-	int reg = modnet_register(argv[1]);
+	__modnet_module_operations = module;
+	
+	int reg = modnet_register(__modnet_module_operations->module_name);
 
 	if(reg < 0)
 	{
@@ -421,10 +429,10 @@ int main(int argc, char **argv)
 
 	// determining the number of logical CPUs, 
 	// since we have one worker per logical cpu
-	NUM_WORKERS = get_cpu_count();
-	printf("Detected %d logical allowed CPUs\n", NUM_WORKERS);
+	__NUM_WORKERS = get_cpu_count();
+	printf("Detected %d logical allowed CPUs\n", __NUM_WORKERS);
 
-	for(x = 0; x < NUM_WORKERS - 1; x++){
+	for(x = 0; x < __NUM_WORKERS - 1; x++){
 		if(fork() == 0)
 			break;
 		mask = mask << 1;
@@ -436,6 +444,8 @@ int main(int argc, char **argv)
 	if(i != 0)
 		perror("evthread_use_pthreads failed\n");
 
+	//TODO(sharva): worker threads
+	
 	pthread_t fishing_thread;
 	int err = pthread_create(&fishing_thread, NULL, &event_worker, NULL);
 
